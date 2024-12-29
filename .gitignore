@@ -1,2 +1,5 @@
 .env
 temp/
+cookies.json
+proxies.json
+proxy.txt

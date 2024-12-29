@@ -7,10 +7,10 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -21,8 +21,10 @@ import (
 )
 
 const (
-	proxyURL    = "https://simple-proxy.xartpvt.workers.dev?destination="
-	showboxBase = "https://www.showbox.media"
+	proxyURL    = "https://simple-proxy-2.xartpvt.workers.dev?destination="
+	scraperBase = "https://api.zenrows.com/v1/"
+	apiKey      = "03f49e9ebd5e632b3fbb479e5a0e72ea6d5efda0"
+	showboxBase = "http://156.242.65.27/"
 	feboxBase   = "https://www.febbox.com"
 	userAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
 )
@@ -41,12 +43,6 @@ type FileInfo struct {
 	Thumbnail string `json:"thumb_big"`
 }
 
-type showboxResponse struct {
-	Data struct {
-		Link string `json:"link"`
-	} `json:"data"`
-}
-
 type fileResponse struct {
 	Data struct {
 		File FileInfo `json:"file"`
@@ -63,51 +59,44 @@ type Scraper struct {
 	collector   *colly.Collector
 	dbRepo      *repository.MongoRepo
 	client      *http.Client
-	visitedURLs map[string]bool // Move visitedURLs here to persist across all scrapes
+	visitedURLs map[string]bool
+	mu          sync.Mutex
 }
 
-func NewScraper(dbRepo *repository.MongoRepo) (*Scraper, error) {
-	c := colly.NewCollector(
-		colly.AllowedDomains("www.showbox.media", "simple-proxy.xartpvt.workers.dev", "www.febbox.com"),
-		colly.UserAgent(userAgent),
-	)
-
-	c.SetRequestTimeout(120 * time.Second)
-
-	if err := c.Limit(&colly.LimitRule{
-		DomainGlob:  "*",
-		Parallelism: 5,
-		RandomDelay: 3 * time.Second,
-	}); err != nil {
-		return nil, fmt.Errorf("failed to set rate limit: %w", err)
-	}
-
-	visitedURLs := make(map[string]bool)
-
+func NewScraper(dbRepo *repository.MongoRepo) *Scraper {
 	return &Scraper{
-		collector:   c,
+		client:      &http.Client{Timeout: 120 * time.Second},
 		dbRepo:      dbRepo,
-		client:      &http.Client{},
-		visitedURLs: visitedURLs,
-	}, nil
+		visitedURLs: make(map[string]bool),
+	}
+}
+
+func (s *Scraper) isVisited(url string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.visitedURLs[url]
+}
+
+func (s *Scraper) markVisited(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.visitedURLs[url] = true
 }
 
 func (s *Scraper) setupCollector(currentMovie *Movie) {
 
 	s.collector.OnRequest(func(r *colly.Request) {
-		if _, visited := s.visitedURLs[r.URL.String()]; visited == true {
-			log.Printf("Skipping duplicate visit: %s", r.URL.String())
+		if s.isVisited(r.URL.String()) {
+			//log.Printf("Skipping duplicate visit: %s", r.URL.String())
 			r.Abort()
 			return
 		}
 		log.Printf("Visiting: %s\n", r.URL.String())
+		s.markVisited(r.URL.String())
 	})
 
 	s.collector.OnResponse(func(r *colly.Response) {
-		visitedURL := r.Request.URL.String()
-		// Mark the URL as visited after the response is received
-		s.visitedURLs[visitedURL] = true
-		log.Printf("Marked as visited: %s", visitedURL)
+		log.Printf("Finished scraping: %s", r.Request.URL.String())
 	})
 
 	s.collector.OnScraped(func(r *colly.Response) {
@@ -119,7 +108,7 @@ func (s *Scraper) setupCollector(currentMovie *Movie) {
 		var files []models.File
 		e.ForEach("div[data-id]", func(_ int, el *colly.HTMLElement) {
 			fileId := el.Attr("data-id")
-			if file := getFileDetails(fileId); file.FID != 0 {
+			if file, _ := getFileDetails(fileId); file.FID != 0 {
 				files = append(files, file)
 			}
 		})
@@ -131,7 +120,7 @@ func (s *Scraper) setupCollector(currentMovie *Movie) {
 			Files:       files,
 		}
 
-		if err := s.dbRepo.CreateMovie(context.Background(), movie); err != nil {
+		if err := s.dbRepo.CreateMovie(context.Background(), movie); err != nil && len(files) > 0 {
 			log.Printf("Error saving movie to database: %v", err)
 			return
 		}
@@ -140,22 +129,23 @@ func (s *Scraper) setupCollector(currentMovie *Movie) {
 	})
 }
 
-func getFileDetails(fileid string) models.File {
+func getFileDetails(fileid string) (models.File, error) {
 	url := fmt.Sprintf("%s/file/file_info?fid=%s", feboxBase, fileid)
 	resp, err := http.Get(url)
 	if err != nil {
 		log.Printf("Error getting file info: %v", err)
-		return models.File{}
+		return models.File{}, nil
 	}
 	defer resp.Body.Close()
 
 	var data fileResponse
 	if err = json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		log.Printf("Error decoding file info: %v", err)
-		return models.File{}
+		return models.File{}, nil
 	}
 
 	links := getQualities(fileid)
+	//log.Println(links)
 
 	return models.File{
 		FID:      data.Data.File.Fid,
@@ -163,7 +153,7 @@ func getFileDetails(fileid string) models.File {
 		Size:     data.Data.File.Size,
 		ThumbURL: data.Data.File.Thumbnail,
 		Links:    links,
-	}
+	}, nil
 }
 
 func getQualities(fileId string) []models.Link {
@@ -264,6 +254,148 @@ func getMoviesList(start, end int) []Movie {
 	return movies[start : end+1]
 }
 
+func (s *Scraper) scrapeMovie(movie *Movie, idx int) error {
+	shoemediaUrl := fmt.Sprintf("%s/index/share_link?id=%s&type=1", showboxBase, movie.ID)
+	req, err := http.NewRequest("GET", shoemediaUrl, nil)
+	if err != nil {
+		log.Printf("Error creating request for movie %s: %v", movie.ID, err)
+		return fmt.Errorf("request creation failed: %w", err)
+	}
+
+	req.Header.Set("User-Agent", userAgent)
+
+	res, err := s.client.Do(req)
+	if err != nil {
+		log.Printf("Error fetching data for movie %s: %v", movie.ID, err)
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusTooManyRequests {
+		log.Printf("Rate limited while fetching movie %s: %s , %d", movie.ID, res.Status, idx)
+		return fmt.Errorf("rate limited: status %d", res.StatusCode)
+	}
+	if res.StatusCode != http.StatusOK {
+		log.Printf("Unexpected response for movie %s: %s", movie.ID, res.Status)
+		return fmt.Errorf("unexpected status: %d", res.StatusCode)
+	}
+
+	var output struct {
+		Data struct {
+			Link string `json:"link"`
+		} `json:"data"`
+	}
+	if err = json.NewDecoder(res.Body).Decode(&output); err != nil {
+		log.Printf("Error decoding response for movie %s: %v", movie.ID, err)
+		return fmt.Errorf("response decoding failed: %w", err)
+	}
+
+	if s.isVisited(output.Data.Link) {
+		log.Printf("Already visited: %s", output.Data.Link)
+		return nil
+	}
+
+	log.Printf("Scraping movie: %s", movie.Title)
+	s.scrapeMovieDetails(output.Data.Link, movie, idx)
+	return nil
+}
+
+func (s *Scraper) scrapeMovieDetails(link string, movie *Movie, idx int) {
+	req, err := http.NewRequest("GET", link, nil)
+	if err != nil {
+		log.Printf("Error creating request for link %s: %v", link, err)
+		return
+	}
+	req.Header.Set("Cookie", os.Getenv("FEBBOX_COOKIE"))
+
+	req.Header.Set("User-Agent", userAgent)
+	res, err := s.client.Do(req)
+	if err != nil {
+		log.Printf("Error scraping link %s: %v", link, err)
+		return
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusTooManyRequests {
+		log.Printf("Rate limited while fetching movie %s: %s %s", movie.ID, res.Status, link, idx)
+		return
+	}
+
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	if err != nil {
+		log.Printf("Error parsing HTML: %v", err)
+		return
+	}
+
+	var files []models.File
+	doc.Find(".f_list_scroll div[data-id]").Each(func(i int, s *goquery.Selection) {
+		//log.Println("reached")
+		fileID, exists := s.Attr("data-id")
+		if exists {
+			file, _ := getFileDetails(fileID)
+			if file.FID != 0 {
+				files = append(files, file)
+			}
+		}
+	})
+
+	movieModel := &models.Movie{
+		Title:       movie.Title,
+		Description: movie.Description,
+		MovieID:     movie.ID,
+		Files:       files,
+	}
+
+	if err := s.dbRepo.CreateMovie(context.Background(), movieModel); err != nil && len(files) > 0 {
+		log.Printf("Error saving movie to database: %v", err)
+		return
+	}
+
+	log.Printf("Successfully saved movie: %s", movieModel.Title)
+}
+
+func (s *Scraper) scrapeMoviesConcurrently(movies []Movie, maxConcurrency int, interval time.Duration) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrency) // Semaphore to limit concurrency
+	ticker := time.NewTicker(interval)         // Ticker to throttle requests
+	defer ticker.Stop()
+
+	for idx, movie := range movies {
+		wg.Add(1)
+
+		go func(m Movie) {
+			defer wg.Done()
+
+			<-ticker.C // Wait for the next ticker signal to throttle requests
+
+			sem <- struct{}{}        // Acquire a slot
+			defer func() { <-sem }() // Release the slot
+
+			for retries := 0; retries < 3; retries++ { // Retry logic
+				err := s.scrapeMovie(&m, idx)
+				if err != nil {
+					log.Printf("Error scraping movie %s: %v", m.Title, err)
+					if isRateLimitError(err) {
+						log.Println("Rate limited, retrying...")
+						time.Sleep(time.Duration(2<<retries) * time.Second) // Exponential backoff
+						continue
+					}
+				}
+				break // Exit loop if successful or not rate-limited
+			}
+		}(movie)
+	}
+
+	wg.Wait()
+}
+
+func isRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for HTTP 429 or other rate-limit indicators
+	return strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "rate limit")
+}
+
 func main() {
 	dbcon, err := db.NewMongoConn()
 	if err != nil {
@@ -275,49 +407,12 @@ func main() {
 		dbcon.Database("showbox").Collection("tv"),
 	)
 
-	scraper, err := NewScraper(dbRepo)
-	if err != nil {
-		log.Fatal(err)
-	}
+	scraper := NewScraper(dbRepo)
 
-	movies := getMoviesList(2, 3)
-	log.Println(len(movies))
+	movies := getMoviesList(1449, 1500)
 
-	for _, movie := range movies {
-		scraper.setupCollector(&movie)
+	maxConcurrency := 5
+	requestInterval := 1 * time.Second
 
-		urllink := proxyURL + url.QueryEscape(fmt.Sprintf("%s/index/share_link?id=%s&type=1", showboxBase, movie.ID))
-		req, err := http.NewRequest("GET", urllink, nil)
-		if err != nil {
-			log.Printf("Error creating request for movie %s: %v", movie.ID, err)
-			continue
-		}
-
-		log.Println(urllink)
-
-		req.Header.Set("User-Agent", userAgent)
-		res, err := scraper.client.Do(req)
-		if err != nil {
-			log.Printf("Error getting response for movie %s: %v", movie.ID, err)
-			continue
-		}
-
-		var output showboxResponse
-		err = json.NewDecoder(res.Body).Decode(&output)
-		res.Body.Close()
-		if err != nil {
-			log.Printf("Error decoding response for movie %s: %v", movie.ID, err)
-			continue
-		}
-
-		if err := scraper.collector.Visit(output.Data.Link); err != nil {
-			if err == colly.ErrAlreadyVisited {
-				log.Printf("URL already visited: %s", output.Data.Link)
-			} else {
-				log.Printf("Error visiting link for movie %s: %v", movie.ID, err)
-			}
-		}
-	}
-
-	scraper.collector.Wait()
+	scraper.scrapeMoviesConcurrently(movies, maxConcurrency, requestInterval)
 }
