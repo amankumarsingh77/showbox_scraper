@@ -22,8 +22,6 @@ import (
 
 const (
 	proxyURL    = "https://simple-proxy-2.xartpvt.workers.dev?destination="
-	scraperBase = "https://api.zenrows.com/v1/"
-	apiKey      = "03f49e9ebd5e632b3fbb479e5a0e72ea6d5efda0"
 	showboxBase = "http://156.242.65.27/"
 	feboxBase   = "https://www.febbox.com"
 	userAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
