@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -299,17 +300,17 @@ func (s *Scraper) scrapeMovie(movie *Movie, idx int) error {
 }
 
 func (s *Scraper) scrapeMovieDetails(link string, movie *Movie, idx int) {
-	//proxyurl := os.Getenv("PROXY_URL")
-	//proxy, err := url.Parse(proxyurl)
-	//if err != nil {
-	//	log.Printf("Error parsing proxy URL: %v", err)
-	//	return
-	//}
-	//client := &http.Client{
-	//	Transport: &http.Transport{
-	//		Proxy: http.ProxyURL(proxy),
-	//	},
-	//}
+	proxyurl := os.Getenv("PROXY_URL")
+	proxy, err := url.Parse(proxyurl)
+	if err != nil {
+		log.Printf("Error parsing proxy URL: %v", err)
+		return
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxy),
+		},
+	}
 	req, err := http.NewRequest("GET", link, nil)
 	if err != nil {
 		log.Printf("Error creating request for link %s: %v", link, err)
@@ -318,14 +319,17 @@ func (s *Scraper) scrapeMovieDetails(link string, movie *Movie, idx int) {
 	req.Header.Set("Cookie", os.Getenv("FEBBOX_COOKIE"))
 
 	req.Header.Set("User-Agent", userAgent)
-	res, err := s.client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		log.Printf("Error scraping link %s: %v %d", link, err, idx)
 		return
 	}
 	defer res.Body.Close()
 	if res.StatusCode == http.StatusTooManyRequests {
+		time.Sleep(time.Duration(2) * time.Second)
 		log.Printf("Rate limited while fetching movie %s: %s %s %d", movie.ID, res.Status, link, idx)
+		s.scrapeMovieDetails(link, movie, idx)
+		log.Printf("Retrying after 2 seconds : %s", link)
 		return
 	}
 
@@ -413,7 +417,7 @@ func main() {
 
 	dbRepo := repository.NewMongoRepo(
 		dbcon.Database("showbox").Collection("movies"),
-		dbcon.Database("showbox").Collection("tv"),
+		//dbcon.Database("showbox").Collection("tv"),
 	)
 
 	scraper := NewScraper(dbRepo)
