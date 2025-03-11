@@ -3,13 +3,14 @@ package febox
 import (
 	"encoding/json"
 	"errors"
-	"github.com/PuerkitoBio/goquery"
-	"github.com/amankumarsingh77/go-showbox-api/db/models"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/amankumarsingh77/go-showbox-api/db/models"
 )
 
 func getMoviesList(start, end int) []models.Movie {
@@ -34,6 +35,26 @@ func getMoviesList(start, end int) []models.Movie {
 	}
 
 	return movies[start : end+1]
+}
+
+func GetSeriesList(start, end int) []models.TV {
+	dir, err := os.Getwd()
+	if err != nil {
+		log.Fatal("Failed to get working directory:", err)
+	}
+
+	filePath := filepath.Join(dir, "tv_final.json")
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.Fatal("Error reading file:", err)
+	}
+
+	var series []models.TV
+	if err := json.Unmarshal(data, &series); err != nil {
+		log.Fatal("Error unmarshaling JSON:", err)
+	}
+
+	return series[start : end+1]
 }
 
 func parseHTMLToJSON(html string) []VideoQuality {

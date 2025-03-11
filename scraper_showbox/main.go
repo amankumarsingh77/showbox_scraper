@@ -47,7 +47,7 @@ func NewScraper(baseURL, proxyurl string, startPage, endPage int) (*Scraper, err
 
 	err := c.Limit(&colly.LimitRule{
 		DomainGlob:  "*",
-		Parallelism: 5,
+		Parallelism: 2,
 		RandomDelay: 3 * time.Second,
 	})
 	if err != nil {
@@ -317,7 +317,7 @@ func (s *Scraper) Run() {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	scraper, err := NewScraper("https://www.showbox.media", "https://simple-proxy.xartpvt.workers.dev?destination=", 1, 10)
+	scraper, err := NewScraper("https://www.showbox.media", "https://simple-proxy.ak7702401082.workers.dev?destination=", 1, 10)
 	if err != nil {
 		log.Fatalf("Failed to create scraper: %v", err)
 	}

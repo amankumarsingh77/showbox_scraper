@@ -3,6 +3,7 @@ package showbox
 import (
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,10 +19,12 @@ type Scraper struct {
 	collector  *colly.Collector
 	storage    *Storage
 	movies     []Movie
+	tv         []Tv
 	visited    sync.Map
 	mu         sync.RWMutex
 	shutdown   chan struct{}
 	done       chan struct{}
+	isMovie    bool
 	activeJobs sync.WaitGroup
 }
 
@@ -29,7 +32,7 @@ func NewScraper(config *Config, storage *Storage) (*Scraper, error) {
 	c := colly.NewCollector(
 		colly.AllowedDomains("www.showbox.media", "simple-proxy.xartpvt.workers.dev"),
 		colly.UserAgent(config.UserAgent),
-		colly.Async(true),
+		colly.Async(false),
 	)
 
 	c.SetRequestTimeout(time.Duration(config.Timeout) * time.Second)
@@ -49,6 +52,8 @@ func NewScraper(config *Config, storage *Storage) (*Scraper, error) {
 		storage:   storage,
 		shutdown:  make(chan struct{}),
 		done:      make(chan struct{}),
+		isMovie:   config.isMovie,
+		visited:   sync.Map{},
 	}, nil
 }
 
@@ -66,9 +71,12 @@ func (s *Scraper) setupCallbacks() {
 	s.collector.OnError(func(r *colly.Response, err error) {
 		defer s.activeJobs.Done()
 		if r.StatusCode == 429 {
-			time.Sleep(4 * time.Second)
-			log.Printf("Rate limit exceeded: %d (Status: %s)\n", r.StatusCode, r.Request.URL)
+			retryDelay := 10 * time.Second
+			log.Printf("Rate limit exceeded: %s (Status: %d). Waiting %s before retrying...\n",
+				r.Request.URL, r.StatusCode, retryDelay)
+			time.Sleep(retryDelay)
 			r.Request.Retry()
+			return
 		}
 		log.Printf("Error on %s: %v (Status: %d)\n", r.Request.URL, err, r.StatusCode)
 	})
@@ -145,28 +153,50 @@ func (s *Scraper) setupCallbacks() {
 					production = value
 				}
 			})
+			if s.config.isMovie {
+				movie := Movie{
+					ID:          id,
+					Title:       cleanText(e.ChildText(".heading-name")),
+					Description: cleanText(e.ChildText(".description")),
+					ReleaseDate: releaseDate,
+					Genre:       genre,
+					Casts:       casts,
+					Duration:    duration,
+					Country:     country,
+					Production:  production,
+					IMDBRating:  imdbRating,
+					ScrapedAt:   time.Now(),
+				}
 
-			movie := Movie{
-				ID:          id,
-				Title:       cleanText(e.ChildText(".heading-name")),
-				Description: cleanText(e.ChildText(".description")),
-				ReleaseDate: releaseDate,
-				Genre:       genre,
-				Casts:       casts,
-				Duration:    duration,
-				Country:     country,
-				Production:  production,
-				IMDBRating:  imdbRating,
-				ScrapedAt:   time.Now(),
+				// log.Println(movie)
+
+				s.mu.Lock()
+				s.movies = append(s.movies, movie)
+				s.mu.Unlock()
+			} else {
+				tv := Tv{
+					ID:          id,
+					Title:       cleanText(e.ChildText(".heading-name")),
+					Description: cleanText(e.ChildText(".description")),
+					ReleaseDate: releaseDate,
+					Genre:       genre,
+					Casts:       casts,
+					Duration:    duration,
+					Country:     country,
+					Production:  production,
+					IMDBRating:  imdbRating,
+					ScrapedAt:   time.Now(),
+				}
+				log.Println(tv)
+				s.mu.Lock()
+				s.tv = append(s.tv, tv)
+				s.mu.Unlock()
 			}
 
-			log.Println(movie)
-
-			s.mu.Lock()
-			s.movies = append(s.movies, movie)
-			s.mu.Unlock()
 		}
 	})
+
+	//tv
 
 }
 
@@ -176,35 +206,104 @@ func (s *Scraper) Run() error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	// Start the sequential page processing
 	go func() {
+		defer close(s.done)
+
 		for page := s.config.StartPage; page <= s.config.EndPage; page++ {
 			select {
 			case <-s.shutdown:
 				return
 			default:
-				url := fmt.Sprintf("%s/movie?page=%d", s.config.BaseURL, page)
+				var url string
+				if s.config.isMovie {
+					url = fmt.Sprintf("%s%s/movie?page=%d", s.config.ProxyURL, s.config.BaseURL, page)
+				} else {
+					url = fmt.Sprintf("%s%s/tv?page=%d", s.config.ProxyURL, s.config.BaseURL, page)
+				}
+
 				if _, exists := s.visited.LoadOrStore(url, true); !exists {
-					s.activeJobs.Add(1)
-					go func(url string) {
-						defer s.activeJobs.Done()
-						if err := s.collector.Visit(url); err != nil {
-							log.Printf("Failed to visit %s: %v\n", url, err)
+					log.Printf("Processing page %d: %s\n", page, url)
+
+					// Visit the page - this will block until page is fully processed
+					// since we set Async to false in the collector
+					if err := s.collector.Visit(url); err != nil {
+						log.Printf("Failed to visit page %d (%s): %v\n", page, url, err)
+						continue
+					}
+
+					// Track progress after each page
+					if page%5 == 0 || page == s.config.EndPage {
+						log.Printf("Saving progress after page %d...\n", page)
+						if s.config.isMovie {
+							if err := s.storage.SaveProgress(s.movies); err != nil {
+								log.Printf("Error saving movie progress: %v\n", err)
+							}
+						} else {
+							if err := s.storage.SaveTVProgress(s.tv); err != nil {
+								log.Printf("Error saving TV progress: %v\n", err)
+							}
 						}
-					}(url)
+					}
+
+					// Add delay before next page with a random component to avoid predictable patterns
+					baseDelay := 3 * time.Second
+					randomDelay := time.Duration(rand.Intn(2000)) * time.Millisecond
+					totalDelay := baseDelay + randomDelay
+					log.Printf("Page %d completed. Waiting %s before next page...\n", page, totalDelay)
+					time.Sleep(totalDelay)
 				}
 			}
 		}
+
+		log.Println("All pages have been processed.")
 	}()
 
+	// Wait for either a signal or completion
 	select {
 	case <-sigChan:
-		log.Println("Signal received. Shutting down...")
+		log.Println("Signal received. Shutting down immediately...")
 		close(s.shutdown)
+
+		// Immediately stop all collector requests
+		s.collector.AllowedDomains = []string{}
+		s.collector.DisallowedDomains = []string{"*"}
+
+		// Force the collector to stop any ongoing requests
+		s.collector.OnRequest(func(r *colly.Request) {
+			r.Abort()
+		})
+
+		log.Println("Saving current progress...")
+		if err := s.storage.SaveProgress(s.movies); err != nil {
+			log.Printf("Error saving progress: %v\n", err)
+		}
+
+		// Also save and merge TV progress if not in movie mode
+		if !s.config.isMovie {
+			if err := s.storage.SaveTVProgress(s.tv); err != nil {
+				log.Printf("Error saving TV progress: %v\n", err)
+			}
+			// Merge TV files separately
+			if err := s.storage.MergeTVFiles(); err != nil {
+				log.Printf("Error during TV merge: %v\n", err)
+			}
+		}
+
+		// Merge only movie files
+		if err := s.storage.MergeMovieFiles(); err != nil {
+			log.Printf("Error during movie merge: %v\n", err)
+		}
+
+		log.Println("Scraper stopped due to user interrupt.")
+		return nil
+
 	case <-s.done:
 		log.Println("All jobs completed. Shutting down...")
 		close(s.shutdown)
 	}
 
+	// Wait for collector to finish (for normal completion flow)
 	s.collector.Wait()
 	s.activeJobs.Wait()
 
@@ -212,8 +311,20 @@ func (s *Scraper) Run() error {
 		log.Printf("Error saving progress: %v\n", err)
 	}
 
-	if err := s.storage.MergeFiles(); err != nil {
-		log.Printf("Error during final merge: %v\n", err)
+	// Also save and merge TV progress if not in movie mode
+	if !s.config.isMovie {
+		if err := s.storage.SaveTVProgress(s.tv); err != nil {
+			log.Printf("Error saving TV progress: %v\n", err)
+		}
+		// Merge TV files separately
+		if err := s.storage.MergeTVFiles(); err != nil {
+			log.Printf("Error during TV merge: %v\n", err)
+		}
+	}
+
+	// Merge only movie files
+	if err := s.storage.MergeMovieFiles(); err != nil {
+		log.Printf("Error during movie merge: %v\n", err)
 	}
 
 	log.Println("Scraper shutdown gracefully.")

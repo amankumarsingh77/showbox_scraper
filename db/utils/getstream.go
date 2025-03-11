@@ -3,14 +3,15 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/PuerkitoBio/goquery"
-	"github.com/amankumarsingh77/go-showbox-api/db/models"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/PuerkitoBio/goquery"
+	"github.com/amankumarsingh77/go-showbox-api/db/models"
 )
 
 const feboxBase = "https://www.febbox.com"
@@ -103,4 +104,64 @@ func parseHtmlToJson(html string) []VideoQuality {
 		videos = append(videos, video)
 	})
 	return videos
+}
+
+// UpdateEpisodeStream updates the links for TV episode sources
+func UpdateEpisodeStream(source *models.Source) error {
+	for i := range source.Files {
+		file := &source.Files[i]
+
+		url := fmt.Sprintf("%s/console/video_quality_list?fid=%s?type=1", feboxBase, strconv.FormatInt(file.FID, 10))
+		client := &http.Client{
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return nil
+			},
+		}
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			log.Printf("Error creating request: %v", err)
+			return err
+		}
+
+		req.Header.Add("Cookie", os.Getenv("FEBBOX_COOKIE"))
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("Error getting qualities: %v", err)
+			return err
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Error reading response body: %v", err)
+			return err
+		}
+
+		var input map[string]interface{}
+		if err = json.Unmarshal(body, &input); err != nil {
+			log.Printf("Error unmarshaling response: %v", err)
+			return err
+		}
+
+		html, ok := input["html"].(string)
+		if !ok {
+			log.Println("HTML field not found in response")
+			return fmt.Errorf("HTML field not found in response")
+		}
+
+		data := parseHtmlToJson(html)
+		var links []models.Link
+		for _, quality := range data {
+			link := models.Link{
+				Quality: quality.Quality,
+				URL:     quality.URL,
+				Size:    quality.Size,
+			}
+			links = append(links, link)
+		}
+		file.Links = links
+	}
+
+	return nil
 }

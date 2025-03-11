@@ -3,13 +3,14 @@ package db
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"time"
+
 	"github.com/joho/godotenv"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
-	"log"
-	"os"
-	"time"
 )
 
 func NewMongoConn() (*mongo.Client, error) {
@@ -48,6 +49,11 @@ func NewMongoConn() (*mongo.Client, error) {
 		return nil, err
 	}
 
+	// Ensure indexes on the "tv" collection
+	if err := createTVTextIndex(client, dbName); err != nil {
+		return nil, err
+	}
+
 	log.Println("Connected to MongoDB successfully")
 	return client, nil
 }
@@ -81,5 +87,37 @@ func createMovieTextIndex(client *mongo.Client, dbName string) error {
 	}
 
 	log.Println("Text index created on movies collection")
+	return nil
+}
+
+func createTVTextIndex(client *mongo.Client, dbName string) error {
+	db := client.Database(dbName)
+	collection := db.Collection("tv")
+
+	indexModel := mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "title", Value: "text"},
+			{Key: "description", Value: "text"},
+		},
+		Options: options.Index().SetDefaultLanguage("english"),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, err := collection.Indexes().CreateOne(ctx, indexModel)
+	if err != nil {
+		return fmt.Errorf("failed to create text index on tv collection: %w", err)
+	}
+
+	_, err = collection.Indexes().CreateOne(context.Background(), mongo.IndexModel{
+		Keys:    bson.M{"tv_id": 1},
+		Options: options.Index().SetUnique(true),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create unique index on tv collection: %w", err)
+	}
+
+	log.Println("Text index created on tv collection")
 	return nil
 }

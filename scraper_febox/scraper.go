@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	proxyURL    = "https://simple-proxy-2.xartpvt.workers.dev?destination="
+	proxyURL    = "https://simple-proxy.ak7702401082.workers.dev?destination="
 	showboxBase = "http://156.242.65.27/"
 	feboxBase   = "https://www.febbox.com"
 	userAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
@@ -417,7 +417,7 @@ func main() {
 
 	dbRepo := repository.NewMongoRepo(
 		dbcon.Database("showbox").Collection("movies"),
-		//dbcon.Database("showbox").Collection("tv"),
+		dbcon.Database("showbox").Collection("tv"),
 	)
 
 	scraper := NewScraper(dbRepo)

@@ -1,12 +1,13 @@
 package febox
 
 import (
-	"github.com/amankumarsingh77/go-showbox-api/db/models"
-	"github.com/amankumarsingh77/go-showbox-api/db/repository"
 	"log"
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/amankumarsingh77/go-showbox-api/db/models"
+	"github.com/amankumarsingh77/go-showbox-api/db/repository"
 )
 
 type Scraper struct {
@@ -28,23 +29,28 @@ func NewScraper(dbRepo *repository.MongoRepo, cfg *Config) *Scraper {
 	}
 }
 
+// ScrapeMoviesConcurrently scrapes multiple movies concurrently
+// Maintained for backward compatibility - consider using ScrapeContentConcurrently for new code
 func (s *Scraper) ScrapeMoviesConcurrently(movies []models.Movie) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, s.config.MaxConcurrency)
 	ticker := time.NewTicker(time.Duration(s.config.RequestInterval) * time.Second)
 	defer ticker.Stop()
 
-	for idx, movie := range movies {
+	for idx := range movies {
 		wg.Add(1)
-		go func(m models.Movie, idx int) {
+		go func(idx int) {
 			defer wg.Done()
 			<-ticker.C
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			// Use a pointer to the movie in the original slice
+			movie := &movies[idx]
+
 			for retries := 0; retries < s.config.MaxRetries; retries++ {
-				if err := s.scrapeMovie(&m, idx); err != nil {
-					log.Printf("Error scraping movie %s: %v", m.Title, err)
+				if err := s.ScrapeContent(movie, idx); err != nil {
+					log.Printf("Error scraping movie %s: %v", movie.Title, err)
 					if isRateLimitError(err) {
 						time.Sleep(time.Duration(s.config.RetryDelay<<retries) * time.Second)
 						continue
@@ -52,7 +58,41 @@ func (s *Scraper) ScrapeMoviesConcurrently(movies []models.Movie) {
 				}
 				break
 			}
-		}(movie, idx)
+		}(idx)
+	}
+	wg.Wait()
+}
+
+// ScrapeSeriesConcurrently scrapes multiple TV series concurrently
+// Maintained for backward compatibility - consider using ScrapeContentConcurrently for new code
+func (s *Scraper) ScrapeSeriesConcurrently(series []models.TV) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, s.config.MaxConcurrency)
+	ticker := time.NewTicker(time.Duration(s.config.RequestInterval) * time.Second)
+	defer ticker.Stop()
+
+	for idx := range series {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			<-ticker.C
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			// Use a pointer to the TV series in the original slice
+			tv := &series[idx]
+
+			for retries := 0; retries < s.config.MaxRetries; retries++ {
+				if err := s.ScrapeContent(tv, idx); err != nil {
+					log.Printf("Error scraping TV series %s: %v", tv.Title, err)
+					if isRateLimitError(err) {
+						time.Sleep(time.Duration(s.config.RetryDelay<<retries) * time.Second)
+						continue
+					}
+				}
+				break
+			}
+		}(idx)
 	}
 	wg.Wait()
 }
@@ -67,4 +107,47 @@ func (s *Scraper) markVisited(url string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.visitedURLs[url] = true
+}
+
+// ScrapeContentConcurrently is a general function that can scrape both movies and TV series concurrently
+func (s *Scraper) ScrapeContentConcurrently(contents []interface{}) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, s.config.MaxConcurrency)
+	ticker := time.NewTicker(time.Duration(s.config.RequestInterval) * time.Second)
+	defer ticker.Stop()
+
+	// For interface{} slice, we need to be careful about pointers
+	// Each element in contents should already be a pointer to the appropriate type
+	for idx, content := range contents {
+		wg.Add(1)
+		go func(c interface{}, idx int) {
+			defer wg.Done()
+			<-ticker.C
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			var title string
+			switch v := c.(type) {
+			case *models.Movie:
+				title = v.Title
+			case *models.TV:
+				title = v.Title
+			default:
+				log.Printf("Unsupported content type: %T", c)
+				return
+			}
+
+			for retries := 0; retries < s.config.MaxRetries; retries++ {
+				if err := s.ScrapeContent(c, idx); err != nil {
+					log.Printf("Error scraping content %s: %v", title, err)
+					if isRateLimitError(err) {
+						time.Sleep(time.Duration(s.config.RetryDelay<<retries) * time.Second)
+						continue
+					}
+				}
+				break
+			}
+		}(content, idx)
+	}
+	wg.Wait()
 }
