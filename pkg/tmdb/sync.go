@@ -51,12 +51,19 @@ func (s *SyncService) SyncMovie(ctx context.Context, movie *models.Movie) error 
 		// If error, continue to search by title
 	}
 
-	// Extract year from file name if available
+	// Extract year from file names - check all files, not just the first one
 	yearFromFile := ""
-	if len(movie.Files) > 0 && movie.Files[0].FileName != "" {
-		yearFromFile = extractYearFromFileName(movie.Files[0].FileName)
-		if yearFromFile != "" {
-			log.Printf("Extracted year from file name: %s", yearFromFile)
+	if len(movie.Files) > 0 {
+		// Check all files for a year, not just the first one
+		for _, file := range movie.Files {
+			if file.FileName != "" {
+				extractedYear := extractYearFromFileName(file.FileName)
+				if extractedYear != "" {
+					yearFromFile = extractedYear
+					log.Printf("Extracted year '%s' from file name: %s", yearFromFile, file.FileName)
+					break // Stop once we find a valid year
+				}
+			}
 		}
 	}
 
@@ -95,7 +102,8 @@ func (s *SyncService) SyncMovie(ctx context.Context, movie *models.Movie) error 
 	}
 
 	// Find the best match, passing the year from file name for better matching
-	bestMatch := findBestMovieMatch(movie.Title, searchResp.Results, yearFromFile)
+	// Also pass the description for fallback similarity matching
+	bestMatch := findBestMovieMatch(movie.Title, movie.Description, searchResp.Results, yearFromFile)
 	if bestMatch == nil {
 		return fmt.Errorf("couldn't find a good match for movie: %s", movie.Title)
 	}
@@ -138,17 +146,22 @@ func (s *SyncService) SyncTV(ctx context.Context, tv *models.TV) error {
 		// If error, continue to search by title
 	}
 
-	// Extract year from file names if available
+	// Extract year from file names - check all files across all episodes
 	yearFromFile := ""
-	if len(tv.Seasons) > 0 && len(tv.Seasons[0].Episodes) > 0 &&
-		len(tv.Seasons[0].Episodes[0].Sources) > 0 &&
-		len(tv.Seasons[0].Episodes[0].Sources[0].Files) > 0 {
-		// Try to get the year from the first episode file name
-		fileName := tv.Seasons[0].Episodes[0].Sources[0].Files[0].FileName
-		if fileName != "" {
-			yearFromFile = extractYearFromFileName(fileName)
-			if yearFromFile != "" {
-				log.Printf("Extracted year from file name: %s", yearFromFile)
+yearCheckLoop:
+	for _, season := range tv.Seasons {
+		for _, episode := range season.Episodes {
+			for _, source := range episode.Sources {
+				for _, file := range source.Files {
+					if file.FileName != "" {
+						extractedYear := extractYearFromFileName(file.FileName)
+						if extractedYear != "" {
+							yearFromFile = extractedYear
+							log.Printf("Extracted year '%s' from file name: %s", yearFromFile, file.FileName)
+							break yearCheckLoop // Stop once we find a valid year
+						}
+					}
+				}
 			}
 		}
 	}
@@ -188,7 +201,8 @@ func (s *SyncService) SyncTV(ctx context.Context, tv *models.TV) error {
 	}
 
 	// Find the best match, passing the year from file name for better matching
-	bestMatch := findBestTVMatch(tv.Title, searchResp.Results, yearFromFile)
+	// Also pass the description for fallback similarity matching
+	bestMatch := findBestTVMatch(tv.Title, tv.Description, searchResp.Results, yearFromFile)
 	if bestMatch == nil {
 		return fmt.Errorf("couldn't find a good match for TV show: %s", tv.Title)
 	}
@@ -488,7 +502,7 @@ func (s *SyncService) syncTVSeasons(ctx context.Context, tv *models.TV, details 
 }
 
 // findBestMovieMatch finds the best match from TMDB results for a movie title
-func findBestMovieMatch(title string, results []MovieResult, yearFromFile string) *MovieResult {
+func findBestMovieMatch(title string, description string, results []MovieResult, yearFromFile string) *MovieResult {
 	if len(results) == 0 {
 		return nil
 	}
@@ -508,6 +522,12 @@ func findBestMovieMatch(title string, results []MovieResult, yearFromFile string
 	// Use year from file name if available and no year in title
 	if titleYear == "" && yearFromFile != "" {
 		titleYear = yearFromFile
+	}
+
+	// Prepare description for similarity matching if available
+	descriptionLower := ""
+	if description != "" {
+		descriptionLower = strings.ToLower(description)
 	}
 
 	type scoredResult struct {
@@ -549,7 +569,21 @@ func findBestMovieMatch(title string, results []MovieResult, yearFromFile string
 			}
 		}
 
-		// 3. Popularity boost (0-20 points)
+		// 3. Description similarity score (0-25 points)
+		// Only if we have descriptions and no strong year match
+		if score < 50 && descriptionLower != "" && result.Overview != "" {
+			resultOverview := strings.ToLower(result.Overview)
+			// Use a simpler similarity metric for descriptions since they're longer
+			descSimilarity := calculateDescriptionSimilarity(descriptionLower, resultOverview)
+			descScore := descSimilarity * 25 // Up to 25 points for similar descriptions
+			score += descScore
+
+			if descScore > 15 {
+				log.Printf("High description similarity (%.2f) for: %s", descScore, result.Title)
+			}
+		}
+
+		// 4. Popularity boost (0-20 points)
 		// More popular movies get a boost, scaled by position in results
 		popScore := math.Min(20, result.Popularity)
 		popBoost := popScore * (1.0 - float64(i)*0.1) // Decrease boost for later results
@@ -583,7 +617,7 @@ func findBestMovieMatch(title string, results []MovieResult, yearFromFile string
 }
 
 // findBestTVMatch finds the best match from TMDB results for a TV show title
-func findBestTVMatch(title string, results []TVResult, yearFromFile string) *TVResult {
+func findBestTVMatch(title string, description string, results []TVResult, yearFromFile string) *TVResult {
 	if len(results) == 0 {
 		return nil
 	}
@@ -604,6 +638,12 @@ func findBestTVMatch(title string, results []TVResult, yearFromFile string) *TVR
 	// Use year from file name if available and no year in title
 	if titleYear == "" && yearFromFile != "" {
 		titleYear = yearFromFile
+	}
+
+	// Prepare description for similarity matching if available
+	descriptionLower := ""
+	if description != "" {
+		descriptionLower = strings.ToLower(description)
 	}
 
 	type scoredResult struct {
@@ -645,7 +685,21 @@ func findBestTVMatch(title string, results []TVResult, yearFromFile string) *TVR
 			}
 		}
 
-		// 3. Popularity boost (0-20 points)
+		// 3. Description similarity score (0-25 points)
+		// Only if we have descriptions and no strong year match
+		if score < 50 && descriptionLower != "" && result.Overview != "" {
+			resultOverview := strings.ToLower(result.Overview)
+			// Use a simpler similarity metric for descriptions since they're longer
+			descSimilarity := calculateDescriptionSimilarity(descriptionLower, resultOverview)
+			descScore := descSimilarity * 25 // Up to 25 points for similar descriptions
+			score += descScore
+
+			if descScore > 15 {
+				log.Printf("High description similarity (%.2f) for: %s", descScore, result.Name)
+			}
+		}
+
+		// 4. Popularity boost (0-20 points)
 		popScore := math.Min(20, result.Popularity)
 		popBoost := popScore * (1.0 - float64(i)*0.1) // Decrease boost for later results
 		score += popBoost
@@ -794,4 +848,70 @@ func extractYearFromFileName(fileName string) string {
 	}
 
 	return ""
+}
+
+// calculateDescriptionSimilarity calculates a similarity score between two descriptions
+// Optimized for longer text comparison by using keyword matching rather than full Levenshtein
+func calculateDescriptionSimilarity(desc1, desc2 string) float64 {
+	// If either description is empty, return 0
+	if desc1 == "" || desc2 == "" {
+		return 0.0
+	}
+
+	// If the descriptions are identical, return 1.0
+	if desc1 == desc2 {
+		return 1.0
+	}
+
+	// Clean up descriptions - remove punctuation and extra spaces
+	cleanupRegex := regexp.MustCompile(`[^\w\s]+`)
+	stopWords := map[string]bool{
+		"a": true, "an": true, "the": true, "and": true, "or": true, "but": true,
+		"in": true, "on": true, "at": true, "to": true, "for": true, "with": true,
+		"about": true, "from": true, "by": true, "as": true, "of": true, "is": true,
+	}
+
+	// Split into words and filter stop words
+	getKeywords := func(text string) []string {
+		text = cleanupRegex.ReplaceAllString(text, " ")
+		words := strings.Fields(text)
+		keywords := make([]string, 0, len(words))
+		for _, word := range words {
+			if len(word) > 2 && !stopWords[strings.ToLower(word)] {
+				keywords = append(keywords, strings.ToLower(word))
+			}
+		}
+		return keywords
+	}
+
+	keywords1 := getKeywords(desc1)
+	keywords2 := getKeywords(desc2)
+
+	// If we don't have enough keywords, fallback to basic Levenshtein
+	if len(keywords1) < 5 || len(keywords2) < 5 {
+		// Use a simplified version for very short descriptions
+		return calculateStringSimilarity(desc1, desc2)
+	}
+
+	// Create a map of keywords from the first description
+	keywordMap := make(map[string]bool)
+	for _, word := range keywords1 {
+		keywordMap[word] = true
+	}
+
+	// Count matches
+	matches := 0
+	for _, word := range keywords2 {
+		if keywordMap[word] {
+			matches++
+		}
+	}
+
+	// Calculate Jaccard similarity: intersection size / union size
+	unionSize := len(keywords1) + len(keywords2) - matches
+	if unionSize == 0 {
+		return 0.0
+	}
+
+	return float64(matches) / float64(unionSize)
 }
